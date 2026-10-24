@@ -24,12 +24,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import math
-from pathlib import Path
-from typing import Any
-
-import numpy as np
-import torch
-import torch.nn.functional as F
+from typing import TYPE_CHECKING, Any
 
 from mteb.models.model_implementations.google_embeddinggemma import (
     EMBEDDING_GEMMA_CITATION,
@@ -39,79 +34,95 @@ from mteb.models.model_implementations.google_embeddinggemma import (
 from mteb.models.model_implementations.google_gemini import GECKO_TRAINING_DATA
 from mteb.models.model_meta import ModelMeta
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import torch
+    from torch.utils.data import DataLoader
+
+    from mteb.abstasks.task_metadata import TaskMetadata
+    from mteb.types import Array, BatchedInput, PromptType
+
 BASE_MODEL_ID = "google/embeddinggemma-2"
 BASE_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
 
 HEAD_REPO_ID = "BrunoHays/embeddinggemma-2-nullspace-audio"
 HEAD_FILENAME = "nullspace_audio_head.safetensors"
-# TODO(before PR): pin to the commit hash returned by `hf upload` instead of the moving branch.
 HEAD_REVISION = "0222035d2bb6e8baa9949b026a87368c520f8eba"
 
 EPS = 1e-5
 HEAD_DIM = 256
-BLOCK_WEIGHT = math.sqrt(128 / HEAD_DIM)  # sqrt(0.5): each 128d block carries half the energy
-
-# Datasets used ONLY to fit the frozen PCA states (Protocol A: no MAEB / MSEB audio involved).
-PCA_FIT_DATASETS = {
-    "ylacombe/expresso",
-    "agkphysics/AudioSet",
-    "lewtun/music_genres",
-    "ashraq/esc50",
-}
+BLOCK_WEIGHT = math.sqrt(
+    128 / HEAD_DIM
+)  # sqrt(0.5): each 128d block carries half the energy
 
 
-# --------------------------------------------------------------------------- pooling (same math as the sweep)
+def _frame_mask_to_bool(
+    frame_mask: torch.Tensor,
+    hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch
 
-
-def _frame_mask_to_bool(frame_mask: torch.Tensor, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if frame_mask.dim() != 2 or frame_mask.shape != hidden.shape[:2]:
-        raise ValueError(f"frame_mask {tuple(frame_mask.shape)} must match hidden[:2] {tuple(hidden.shape[:2])}")
+        raise ValueError(
+            f"frame_mask {tuple(frame_mask.shape)} must match hidden[:2] {tuple(hidden.shape[:2])}"
+        )
     mask = frame_mask.to(device=hidden.device).bool()
     n = mask.sum(dim=1, keepdim=True).clamp(min=1).to(torch.float32)
     return mask, n
 
 
-def masked_mean_pool(hidden: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:
+def masked_mean_pool(
+    hidden: torch.Tensor,
+    frame_mask: torch.Tensor,
+) -> torch.Tensor:
     """Masked temporal mean, L2-normalised. [B, T, D] -> [B, D]."""
+    import torch
+    import torch.nn.functional as F
+
     x = hidden.to(torch.float32)
     mask, n = _frame_mask_to_bool(frame_mask, x)
     x = torch.where(mask.unsqueeze(-1), x, torch.zeros_like(x))
     return F.normalize(x.sum(dim=1) / n, p=2, dim=-1)
 
 
-def masked_mean_std_pool(hidden: torch.Tensor, frame_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def masked_mean_std_pool(
+    hidden: torch.Tensor,
+    frame_mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
     """Masked temporal [mean, std] concatenated, L2-normalised. [B, T, D] -> [B, 2D]."""
+    import torch
+    import torch.nn.functional as F
+
     x = hidden.to(torch.float32)
     mask, n = _frame_mask_to_bool(frame_mask, x)
     m3 = mask.unsqueeze(-1)
     zeros = torch.zeros_like(x)
-    mu = torch.where(m3, x, zeros).sum(dim=1, keepdim=True) / n.unsqueeze(-1)  # [B, 1, D]
+    mu = torch.where(m3, x, zeros).sum(dim=1, keepdim=True) / n.unsqueeze(-1)
     diff = torch.where(m3, x - mu, zeros)
-    sigma = torch.sqrt((diff**2).sum(dim=1) / n + eps)  # [B, D]
+    sigma = torch.sqrt((diff**2).sum(dim=1) / n + eps)
     return F.normalize(torch.cat([mu.squeeze(1), sigma], dim=-1), p=2, dim=-1)
 
 
 @contextlib.contextmanager
-def _clip_order_preserved(st_model: Any):
-    """Make SentenceTransformer's length-sort the identity, so hook captures line up with dataset order.
-
-    ST sorts each call by `_input_length` (longest first) and un-sorts at the end. A monotonically
-    increasing counter (negated inside the sort) yields the identity permutation. Restored on exit.
-    """
+def _clip_order_preserved(st_model: Any):  # noqa: ANN401
+    """Make SentenceTransformer's length-sort the identity, so hook captures line up with dataset order."""
     counter = itertools.count()
-    st_model._input_length = lambda sample: -next(counter)  # noqa: ARG005
+    st_model._input_length = lambda sample: -next(counter)
     try:
         yield
     finally:
         st_model.__dict__.pop("_input_length", None)
 
 
-def _has_audio_column(inputs: Any) -> bool:
+def _has_audio_column(inputs: Any) -> bool:  # noqa: ANN401
     cols = getattr(getattr(inputs, "dataset", None), "column_names", None) or []
     return "audio" in cols
 
 
 def _load_head(path: str | Path) -> dict[str, torch.Tensor]:
+    import torch
     from safetensors.torch import load_file
 
     t = {k: v.to(torch.float32) for k, v in load_file(str(path)).items()}
@@ -133,11 +144,12 @@ def _load_head(path: str | Path) -> dict[str, torch.Tensor]:
 class EmbeddingGemma2NullSpaceWrapper(EmbeddingGemma2Wrapper):
     """`EmbeddingGemma2Wrapper` + frozen null-space PCA head applied to audio inputs only.
 
-    `model_name` is the submission's ModelMeta name (the loader is called as `loader(meta.name, revision=...)`);
-    the checkpoint that is always loaded is `BASE_MODEL_ID` at `revision` (= BASE_REVISION).
+    `model_name` is the submission's ModelMeta name (the loader is called as
+    `loader(meta.name, revision=...)`); the checkpoint that is always loaded is
+    `BASE_MODEL_ID` at `revision` (= BASE_REVISION).
 
     Args:
-        gamma: null-space injection strength (1.0 = headline, 0.7 = second submitted point).
+        gamma: null-space injection strength (default 1.0).
         head_path: local safetensors file. If None, downloaded from `HEAD_REPO_ID` at `head_revision`.
         head_revision: revision of the head repo.
         use_image: forwarded to EmbeddingGemma2Wrapper (False for MAEB).
@@ -146,7 +158,7 @@ class EmbeddingGemma2NullSpaceWrapper(EmbeddingGemma2Wrapper):
 
     def __init__(
         self,
-        model_name: str = BASE_MODEL_ID,  # noqa: ARG002 - submission name, see docstring
+        model_name: str = BASE_MODEL_ID,
         revision: str | None = BASE_REVISION,
         *,
         gamma: float = 1.0,
@@ -169,17 +181,20 @@ class EmbeddingGemma2NullSpaceWrapper(EmbeddingGemma2Wrapper):
         if head_path is None:
             from huggingface_hub import hf_hub_download
 
-            head_path = hf_hub_download(HEAD_REPO_ID, HEAD_FILENAME, revision=head_revision)
+            head_path = hf_hub_download(
+                HEAD_REPO_ID,
+                HEAD_FILENAME,
+                revision=head_revision,
+            )
         self._head = _load_head(head_path)
         self._captures: list[dict[str, torch.Tensor]] = []
         self._recording = False
 
-        # Same audio-tower configuration as the phase-1 runs: hidden_states[k] = Conformer layer k.
         tower = self.model[0].auto_model.audio_tower
         tower.config.tie_last_hidden_states = False
         orig_forward = tower.forward
 
-        def forward_with_hidden(*args: Any, **kw: Any) -> Any:
+        def forward_with_hidden(*args: Any, **kw: Any) -> Any:  # noqa: ANN401
             kw["output_hidden_states"] = True
             out = orig_forward(*args, **kw)
             if self._recording:
@@ -188,54 +203,87 @@ class EmbeddingGemma2NullSpaceWrapper(EmbeddingGemma2Wrapper):
 
         tower.forward = forward_with_hidden
 
-    # ------------------------------------------------------------------ head
-    @torch.no_grad()
-    def _pool_clips(self, out: Any) -> dict[str, torch.Tensor]:
-        mask = out.attention_mask
-        if mask is None:
-            raise RuntimeError("audio_tower returned no attention_mask; refusing to pool unmasked")
-        hs = out.hidden_states
-        if hs is None or len(hs) < 7:
-            raise RuntimeError("audio_tower did not return hidden_states")
-        return {
-            "L2_ms": masked_mean_std_pool(hs[2], mask).to("cpu", torch.float32),
-            "L6_mean": masked_mean_pool(hs[6], mask).to("cpu", torch.float32),
-        }
+    @staticmethod
+    def _pool_clips(out: Any) -> dict[str, torch.Tensor]:  # noqa: ANN401
+        import torch
 
-    @torch.no_grad()
-    def null_space_z(self, l2_ms: torch.Tensor, l6_mean: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            mask = out.attention_mask
+            if mask is None:
+                raise RuntimeError(
+                    "audio_tower returned no attention_mask; refusing to pool unmasked"
+                )
+            hs = out.hidden_states
+            if hs is None or len(hs) < 7:
+                raise RuntimeError("audio_tower did not return hidden_states")
+            return {
+                "L2_ms": masked_mean_std_pool(hs[2], mask).to("cpu", torch.float32),
+                "L6_mean": masked_mean_pool(hs[6], mask).to("cpu", torch.float32),
+            }
+
+    def null_space_z(
+        self,
+        l2_ms: torch.Tensor,
+        l6_mean: torch.Tensor,
+    ) -> torch.Tensor:
         """Frozen 256d null-space coordinates for pooled clip features [N, 2048] and [N, 1024]."""
-        h = self._head
-        z1 = F.normalize(((l2_ms - h["l2_ms_mean"]) @ h["l2_ms_proj"]) / (h["l2_ms_scale"] + EPS), p=2, dim=-1)
-        z2 = F.normalize(((l6_mean - h["l6_m_mean"]) @ h["l6_m_proj"]) / (h["l6_m_scale"] + EPS), p=2, dim=-1)
-        z = torch.cat([BLOCK_WEIGHT * z1, BLOCK_WEIGHT * z2], dim=-1)
-        return F.normalize(z, p=2, dim=-1)
+        import torch
+        import torch.nn.functional as F
 
-    @torch.no_grad()
+        with torch.no_grad():
+            h = self._head
+            z1 = F.normalize(
+                ((l2_ms - h["l2_ms_mean"]) @ h["l2_ms_proj"])
+                / (h["l2_ms_scale"] + EPS),
+                p=2,
+                dim=-1,
+            )
+            z2 = F.normalize(
+                ((l6_mean - h["l6_m_mean"]) @ h["l6_m_proj"]) / (h["l6_m_scale"] + EPS),
+                p=2,
+                dim=-1,
+            )
+            z = torch.cat([BLOCK_WEIGHT * z1, BLOCK_WEIGHT * z2], dim=-1)
+            return F.normalize(z, p=2, dim=-1)
+
     def inject(self, v_base: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """v_final = normalize(v_base + gamma * z @ U_perp^T); v_base is normalised first (as in the sweep)."""
-        v = F.normalize(v_base.to(torch.float32), p=2, dim=-1)
-        if self.gamma == 0.0:
-            return v
-        return F.normalize(v + self.gamma * (z @ self._head["u_perp"].T), p=2, dim=-1)
+        """v_final = normalize(v_base + gamma * z @ U_perp^T); v_base is normalised first."""
+        import torch
+        import torch.nn.functional as F
 
-    # ------------------------------------------------------------------ mteb entrypoint
+        with torch.no_grad():
+            v = F.normalize(v_base.to(torch.float32), p=2, dim=-1)
+            if self.gamma == 0.0:
+                return v
+            return F.normalize(
+                v + self.gamma * (z @ self._head["u_perp"].T),
+                p=2,
+                dim=-1,
+            )
+
     def encode(
         self,
-        inputs: Any,
+        inputs: DataLoader[BatchedInput],
         *,
-        task_metadata: Any,
+        task_metadata: TaskMetadata,
         hf_split: str,
         hf_subset: str,
-        prompt_type: Any | None = None,
+        prompt_type: PromptType | None = None,
         **kwargs: Any,
-    ) -> np.ndarray:
-        base_kwargs = dict(task_metadata=task_metadata, hf_split=hf_split, hf_subset=hf_subset, prompt_type=prompt_type)
+    ) -> Array:
+        import numpy as np
+        import torch
+
+        base_kwargs = dict(
+            task_metadata=task_metadata,
+            hf_split=hf_split,
+            hf_subset=hf_subset,
+            prompt_type=prompt_type,
+        )
         if not _has_audio_column(inputs):
-            # text / image / video: bit-for-bit the EmbeddingGemma2Wrapper path
             return super().encode(inputs, **base_kwargs, **kwargs)
 
-        n_rows = len(inputs.dataset)
+        n_rows = len(inputs.dataset)  # type: ignore[arg-type]
         self._captures = []
         self._recording = True
         try:
@@ -252,23 +300,24 @@ class EmbeddingGemma2NullSpaceWrapper(EmbeddingGemma2Wrapper):
         l2 = torch.cat([c["L2_ms"] for c in caps], dim=0)
         l6 = torch.cat([c["L6_mean"] for c in caps], dim=0)
         if l2.shape[0] != n_rows:
-            raise RuntimeError(f"captured {l2.shape[0]} audio clips for {n_rows} rows; mixed-modality call?")
+            raise RuntimeError(
+                f"captured {l2.shape[0]} audio clips for {n_rows} rows; mixed-modality call?"
+            )
 
         v = torch.as_tensor(np.asarray(emb, dtype=np.float32))
         out = self.inject(v, self.null_space_z(l2, l6))
         return out.numpy().astype(np.float32, copy=False)
 
 
-# --------------------------------------------------------------------------- model metadata
-
-_COMMON_META: dict[str, Any] = dict(
+gladia_embeddinggemma_2_nullspace_audio = ModelMeta(
     loader=EmbeddingGemma2NullSpaceWrapper,  # type: ignore[call-arg]
+    loader_kwargs={"gamma": 1.0, "head_revision": HEAD_REVISION},
+    name="BrunoHays/embeddinggemma-2-nullspace-audio",
     model_type=["dense"],
     languages=MULTILINGUAL_EVALUATED_LANGUAGES,
     open_weights=True,
     revision=BASE_REVISION,
     release_date="2026-10-24",
-    # Text + audio towers loaded (EmbeddingGemma2Wrapper overwrites these from the loaded towers anyway).
     n_parameters=576_613_664,
     n_embedding_parameters=134_217_728,
     memory_usage_mb=2200,
@@ -280,22 +329,10 @@ _COMMON_META: dict[str, Any] = dict(
     use_instructions=True,
     public_training_code=None,
     public_training_data=None,
-    training_datasets=set(GECKO_TRAINING_DATA) | PCA_FIT_DATASETS,
+    training_datasets=GECKO_TRAINING_DATA,
     similarity_fn_name="cosine",
     modalities=["text", "audio"],
     adapted_from=BASE_MODEL_ID,
     citation=EMBEDDING_GEMMA_CITATION,
     extra_requirements_groups=["embeddinggemma"],
-)
-
-gladia_embeddinggemma_2_nullspace_audio = ModelMeta(
-    name="BrunoHays/embeddinggemma-2-nullspace-audio",
-    loader_kwargs={"gamma": 1.0, "head_revision": HEAD_REVISION},
-    **_COMMON_META,
-)
-
-gladia_embeddinggemma_2_nullspace_audio_g07 = ModelMeta(
-    name="BrunoHays/embeddinggemma-2-nullspace-audio-g0.7",
-    loader_kwargs={"gamma": 0.7, "head_revision": HEAD_REVISION},
-    **_COMMON_META,
 )
